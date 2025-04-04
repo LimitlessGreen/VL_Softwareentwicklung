@@ -1,4 +1,4 @@
-name: Generate LiaScript PDFs with liaex
+name: Exporter
 
 on:
   push:
@@ -28,7 +28,7 @@ jobs:
       - name: Create PDF output directory
         run: mkdir pdf_output
 
-      - name: Convert Markdown to PDF with Commit Date Prefix using liaex
+      - name: Convert Markdown to PDF with Commit Date Suffix using liaex
         run: |
           find . -maxdepth 1 -name "*.md" -print0 | while IFS= read -r -d $'\0' file; do
             filename="${file#./}"
@@ -41,7 +41,7 @@ jobs:
             fi
 
             base_name="${filename%.md}"
-            pdf_name="${commit_date}_${base_name}.pdf"
+            pdf_name="${base_name}_${commit_date}.pdf" # Date hinten angehängt
             output_path="pdf_output/$pdf_name"
 
             echo "Output PDF: $output_path"
@@ -52,7 +52,6 @@ jobs:
 
             if [ $? -ne 0 ]; then
               echo "Error converting $filename to PDF using liaex."
-              # exit 1 # Optional: Workflow bei Fehler abbrechen
             fi
           done
 

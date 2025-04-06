@@ -24,7 +24,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm' # Aktiviert Caching für npm Pakete
 
       - name: Install LiaScript Exporter (liaex)
         # Installiert liaex nur, wenn es nicht schon im Cache ist oder package-lock.json sich geändert hat

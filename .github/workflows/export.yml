@@ -48,61 +48,42 @@ jobs:
             fi
 
             base_name="${filename%.md}"
-            # Sicherstellen, dass der Basisname für Dateisysteme und URLs sicher ist (optional, aber empfohlen)
             safe_base_name=$(echo "$base_name" | sed 's/[^a-zA-Z0-9._-]/_/g')
-            pdf_name="${safe_base_name}_${commit_date}.pdf" # Datum hinten angehängt
-            output_path="pdf_output/$pdf_name"
-            artifact_name="$pdf_name" # Name für das individuelle Artefakt
 
-            echo "Expected PDF: $output_path"
-            echo "Artifact Name: $artifact_name"
+            # KORREKTUR: Definiere den Basis-Teil des PDF-Namens (ohne .pdf).
+            # Dieser Name wird an liaex übergeben, da wir annehmen, dass liaex
+            # bei --format pdf die Endung selbst hinzufügt.
+            pdf_base_for_liaex="${safe_base_name}_${commit_date}"
+            output_path_for_liaex="pdf_output/$pdf_base_for_liaex"
 
-            # Cache-Key: Basiert auf dem Hash der Markdown-Datei
-            # Wenn sich die MD-Datei nicht ändert, bleibt der Hash gleich und der Cache kann genutzt werden.
-            # Der Commit-Datum wird *nicht* in den Key einbezogen, da wir die PDF basierend auf dem *aktuellen* Commit-Datum wollen.
-            # Wenn sich die MD-Datei ändert, wird eine neue PDF (mit potenziell neuem Datum) generiert.
-            file_hash=$(git hash-object "$filename")
-            cache_key="pdf-${{ runner.os }}-liaex-${filename}-${file_hash}"
-            echo "Cache Key: $cache_key"
+            # KORREKTUR: Definiere den *finalen* PDF-Dateinamen (mit .pdf).
+            # Dieser wird für Artefakte, Releases und Dateiprüfungen verwendet,
+            # nachdem liaex die Datei (hoffentlich korrekt) erstellt hat.
+            final_pdf_filename="${pdf_base_for_liaex}.pdf"
+            final_output_path="pdf_output/$final_pdf_filename" # Der Pfad, an dem die fertige PDF erwartet wird
+            artifact_name="$final_pdf_filename"               # Der Name für Artefakte/Release-Assets
 
-            # Versuche, die PDF aus dem Cache wiederherzustellen
-            # Wir verwenden den Cache-Schritt hier, um zu prüfen, ob die Datei schon existiert.
-            # actions/cache stellt die Datei wieder her, wenn der Key passt.
-            # Wir müssen danach prüfen, ob die Datei tatsächlich existiert.
+            echo "Output path for liaex: $output_path_for_liaex" # Wird an liaex übergeben
+            echo "Expected final PDF path: $final_output_path"   # Wo die Datei nachher liegen sollte
+            echo "Artifact name: $artifact_name"                 # Für Uploads
 
-            # (Caching-Logik wird implizit durch einen späteren Cache-Schritt gehandhabt,
-            #  der die generierten PDFs speichert. Hier prüfen wir, ob die Datei *bereits*
-            #  durch einen vorherigen Cache-Restore existiert ODER ob sie neu generiert werden muss)
+            # Konvertierung mit liaex: Übergib den Pfad OHNE .pdf Endung
+            liaex --input "$filename" --format pdf --output "$output_path_for_liaex" --pdf-timeout 60000
 
-            # Prüfen, ob die Zieldatei bereits existiert (z.B. durch einen vorherigen Lauf ODER Cache)
-            # Wenn wir Caching *pro Datei* machen wollen, brauchen wir einen Cache-Schritt *pro Datei*.
-            # Einfacher ist es oft, *alle* PDFs zu generieren und dann *alle* PDFs zu cachen/hochzuladen.
-            # Die untenstehende Lösung generiert alle PDFs neu, lädt sie einzeln hoch und fügt sie einem Release hinzu.
-            # Für echtes Caching pro Datei siehe Kommentar unten.
-
-            echo "Converting $filename to $output_path using liaex..."
-            # Konvertierung mit liaex, Format pdf, erhöhtes Timeout
-            liaex --input "$filename" --format pdf --output "$output_path" --pdf-timeout 60000 # 60 Sekunden Timeout
-
-            if [ $? -eq 0 ]; then
-              echo "Successfully converted $filename to $output_path"
-
-              # --- Individuellen PDF Artefakt hochladen ---
-              echo "Uploading artifact: $artifact_name"
-              # Verwende `actions/upload-artifact@v4` direkt hier
-              # ACHTUNG: upload-artifact kann nicht direkt in einem Shell-Skript mit dynamischem Namen aufgerufen werden.
-              # Wir müssen die Dateinamen sammeln und später hochladen oder einen anderen Ansatz wählen.
-
-              # Alternative: Namen sammeln und am Ende hochladen
-              # echo "$artifact_name" >> pdf_files_to_upload.txt
-              # echo "$output_path" >> pdf_paths_to_upload.txt
-
-              # Einfachere Alternative für jetzt: Wir laden *alle* PDFs am Ende hoch,
-              # aber wir bereiten die Release-Assets vor.
-
-            else
+            if [ $? -ne 0 ]; then
               echo "::error::Error converting $filename to PDF using liaex."
-              # Optional: Workflow abbrechen bei Fehler? exit 1
+            else
+              # Optional, aber empfohlen: Prüfen, ob die Datei am *erwarteten* finalen Ort existiert
+              if [ -f "$final_output_path" ]; then
+                 echo "Successfully converted $filename to $final_output_path"
+              else
+                 # Wenn liaex Erfolg meldet (Exit Code 0), aber die Datei nicht am erwarteten Ort mit .pdf liegt,
+                 # war die Annahme (dass liaex .pdf hinzufügt) vielleicht falsch, ODER liaex hat die Datei
+                 # doch anders benannt (z.B. ohne das Datum, falls der Commit nicht gefunden wurde?).
+                 # Oder der Pfad `pdf_output` existiert nicht (sollte durch `mkdir -p` aber behoben sein).
+                 echo "::warning::liaex command finished successfully, but the expected PDF '$final_output_path' was not found. Please check the actual output files and liaex behavior."
+                 # Ggf. muss hier die Logik angepasst werden, falls liaex die Endung doch nicht selbst hinzufügt.
+              fi
             fi
           done
 
@@ -151,17 +132,25 @@ jobs:
           path: pdf_output/
           if-no-files-found: warn
 
-      # --- Automatisches Pre-Release erstellen/aktualisieren ---
-      - name: Create/Update Pre-Release with PDFs
+      - name: Aktuelles Datum ermitteln
+        id: date # Optional, aber gut für die Referenzierung
+        run: echo "CURRENT_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_ENV
+        # Wir speichern das Datum in einer Umgebungsvariable namens CURRENT_DATE
+        # Wichtig: Einfache Anführungszeichen um das Format für date sind sicherer.
+
+      # --- Automatisches Pre-Release erstellen/aktualisieren (auf Deutsch) ---
+      - name: Pre-Release mit PDFs erstellen/aktualisieren
         if: success() && github.ref == 'refs/heads/pdf_export' # Nur auf Master ausführen (oder anpassen)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest-pdfs # Ein fester Tag für das "immer aktuelle" Pre-Release
-          name: "Latest PDF Builds (${{ github.sha }})" # Release-Name mit Commit-SHA
+          # Name des Releases auf Deutsch
+          name: "Aktuellste PDF-Builds (${{ github.sha }})"
+          # Body des Releases auf Deutsch, mit der Datums-Variable
           body: |
-            Automated build of PDF documents from the latest commit on the master branch.
+            Automatischer Build der PDF-Dokumente vom letzten Commit auf dem Branch '${{ github.ref_name }}'.
             Commit: ${{ github.sha }}
-            Date: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            Datum: ${{ env.CURRENT_DATE }} # Hier die Umgebungsvariable verwenden
           prerelease: true # Als Pre-Release markieren
           draft: false # Nicht als Entwurf speichern
           files: pdf_output/*.pdf # Alle PDFs aus dem output Verzeichnis anhängen

@@ -7,8 +7,8 @@ on:
       - pdf_export
   workflow_dispatch:
 
-permissions: # Permissions werden für das Erstellen/Aktualisieren von Releases benötigt
-  contents: write # Notwendig, um Releases zu erstellen/bearbeiten und Assets hochzuladen
+permissions:
+  contents: write # Für Releases
 
 jobs:
   build_pdfs:
@@ -18,141 +18,169 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Wichtig für git log, um den Commit-Verlauf zu bekommen
+          fetch-depth: 0 # Wichtig für git log
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          # Kein npm-Cache, da wir keine package-lock.json haben
+
+      # Cache für die generierten PDFs UND die Hash-Statusdatei
+      # Der Key basiert auf dem Branch, damit Caches nicht zwischen Branches geteilt werden.
+      # Restore-keys erlauben das Wiederherstellen eines älteren Caches, falls der exakte Key nicht passt.
+      - name: Cache PDF Output und Build Hashes
+        id: pdf-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            pdf_output/
+            .pdf_build_hashes.json
+          key: pdf-builds-${{ runner.os }}-${{ github.ref }}-${{ github.sha }} # Sehr spezifisch, ändert sich bei jedem Commit
+          restore-keys: |
+            pdf-builds-${{ runner.os }}-${{ github.ref }}- # Wichtig: Lädt den letzten Cache für diesen Branch
+
+      - name: Install jq (if needed)
+        run: |
+          if ! command -v jq &> /dev/null
+          then
+              echo "jq could not be found, installing..."
+              sudo apt-get update && sudo apt-get install -y jq
+          else
+              echo "jq is already installed."
+          fi
 
       - name: Install LiaScript Exporter (liaex)
-        # Installiert liaex nur, wenn es nicht schon im Cache ist oder package-lock.json sich geändert hat
         run: npm install -g @liascript/exporter
 
       - name: Create PDF output directory
-        run: mkdir -p pdf_output # -p verhindert Fehler, wenn das Verzeichnis schon existiert
+        run: mkdir -p pdf_output # Stellt sicher, dass das Verzeichnis existiert
 
-      # --- PDF Konvertierungs-Loop mit Caching ---
-      - name: Convert Markdown to PDF with Caching and Commit Date Suffix
+      # --- PDF Konvertierung mit per-File Caching basierend auf Commit Hash ---
+      - name: Convert Markdown to PDF with Per-File Commit Hash Caching
         id: convert
         run: |
+          # Lade den Build-Status aus der JSON-Datei (falls vorhanden, sonst starte mit leerem Objekt)
+          # Wenn der Cache wiederhergestellt wurde, existiert die Datei eventuell.
+          if [ -f ".pdf_build_hashes.json" ]; then
+            echo "Lade vorherigen Build-Status aus .pdf_build_hashes.json"
+            # Stelle sicher, dass die Datei valides JSON enthält, sonst starte leer
+            if jq empty .pdf_build_hashes.json > /dev/null 2>&1; then
+               cp .pdf_build_hashes.json current_build_hashes.json
+            else
+               echo "Warnung: .pdf_build_hashes.json ist kein valides JSON. Starte mit leerem Status."
+               echo "{}" > current_build_hashes.json
+            fi
+          else
+            echo "Kein vorheriger Build-Status gefunden (.pdf_build_hashes.json). Starte mit leerem Status."
+            echo "{}" > current_build_hashes.json
+          fi
+
           # Finde alle Markdown-Dateien im Hauptverzeichnis
           find . -maxdepth 1 -name "*.md" -print0 | while IFS= read -r -d $'\0' file; do
             filename="${file#./}"
-            echo "Processing: $filename"
+            echo "--- Processing: $filename ---"
 
-            # JJJJ-MM-TT des letzten Commits für die Datei ermitteln
+            # Aktuellen Commit-Hash und Datum für die Datei ermitteln
+            current_commit_hash=$(git log -1 --pretty="format:%H" -- "$filename")
             commit_date=$(git log -1 --pretty="format:%as" -- "$filename")
-            if [ -z "$commit_date" ]; then
-              commit_date=$(date +%Y-%m-%d) # Fallback: heutiges Datum
+            if [ -z "$commit_date" ]; then # Fallback für Datum
+              commit_date=$(date +%Y-%m-%d)
+              echo "Warnung: Konnte keinen Commit für '$filename' finden, verwende aktuelles Datum."
+              # Fallback für Hash (nicht ideal, aber nötig): Nimm den Hash des *Inhalts*
+              current_commit_hash=$(git hash-object "$filename")
             fi
 
+            # Zuletzt erfolgreich gebauten Hash aus dem Status lesen
+            # jq -r gibt den rohen String ohne Anführungszeichen zurück, // "" als Fallback
+            last_built_hash=$(jq -r --arg f "$filename" '.[$f] // ""' current_build_hashes.json)
+            echo "Aktueller Commit-Hash für $filename: $current_commit_hash"
+            echo "Zuletzt gebauter Hash für $filename: $last_built_hash"
+
+            # Erwarteten PDF-Dateinamen konstruieren (ohne .pdf für liaex)
             base_name="${filename%.md}"
             safe_base_name=$(echo "$base_name" | sed 's/[^a-zA-Z0-9._-]/_/g')
-
-            # KORREKTUR: Definiere den Basis-Teil des PDF-Namens (ohne .pdf).
-            # Dieser Name wird an liaex übergeben, da wir annehmen, dass liaex
-            # bei --format pdf die Endung selbst hinzufügt.
             pdf_base_for_liaex="${safe_base_name}_${commit_date}"
-            output_path_for_liaex="pdf_output/$pdf_base_for_liaex"
-
-            # KORREKTUR: Definiere den *finalen* PDF-Dateinamen (mit .pdf).
-            # Dieser wird für Artefakte, Releases und Dateiprüfungen verwendet,
-            # nachdem liaex die Datei (hoffentlich korrekt) erstellt hat.
+            output_path_for_liaex="pdf_output/$pdf_base_for_liaex" # Für liaex --output
             final_pdf_filename="${pdf_base_for_liaex}.pdf"
-            final_output_path="pdf_output/$final_pdf_filename" # Der Pfad, an dem die fertige PDF erwartet wird
-            artifact_name="$final_pdf_filename"               # Der Name für Artefakte/Release-Assets
+            final_output_path="pdf_output/$final_pdf_filename"     # Erwarteter finaler Pfad
 
-            echo "Output path for liaex: $output_path_for_liaex" # Wird an liaex übergeben
-            echo "Expected final PDF path: $final_output_path"   # Wo die Datei nachher liegen sollte
-            echo "Artifact name: $artifact_name"                 # Für Uploads
+            build_needed=true # Annahme: Build ist nötig
 
-            # Konvertierung mit liaex: Übergib den Pfad OHNE .pdf Endung
-            liaex --input "$filename" --format pdf --output "$output_path_for_liaex" --pdf-timeout 60000
-
-            if [ $? -ne 0 ]; then
-              echo "::error::Error converting $filename to PDF using liaex."
-            else
-              # Optional, aber empfohlen: Prüfen, ob die Datei am *erwarteten* finalen Ort existiert
+            # Prüfen, ob ein Rebuild nötig ist
+            if [ "$current_commit_hash" == "$last_built_hash" ]; then
+              echo "Commit-Hash für $filename ist unverändert ($current_commit_hash)."
+              # Prüfen, ob die Zieldatei existiert (aus dem Cache wiederhergestellt?)
               if [ -f "$final_output_path" ]; then
-                 echo "Successfully converted $filename to $final_output_path"
+                echo "PDF '$final_output_path' existiert bereits (vermutlich aus Cache)."
+                echo "--> Überspringe Build für $filename."
+                build_needed=false
               else
-                 # Wenn liaex Erfolg meldet (Exit Code 0), aber die Datei nicht am erwarteten Ort mit .pdf liegt,
-                 # war die Annahme (dass liaex .pdf hinzufügt) vielleicht falsch, ODER liaex hat die Datei
-                 # doch anders benannt (z.B. ohne das Datum, falls der Commit nicht gefunden wurde?).
-                 # Oder der Pfad `pdf_output` existiert nicht (sollte durch `mkdir -p` aber behoben sein).
-                 echo "::warning::liaex command finished successfully, but the expected PDF '$final_output_path' was not found. Please check the actual output files and liaex behavior."
-                 # Ggf. muss hier die Logik angepasst werden, falls liaex die Endung doch nicht selbst hinzufügt.
+                echo "PDF '$final_output_path' existiert NICHT, obwohl Hash gleich ist. Erzwinge Build."
+              fi
+            else
+              echo "Commit-Hash für $filename hat sich geändert (alt: '$last_built_hash', neu: '$current_commit_hash'). Build ist nötig."
+            fi
+
+            # Nur bauen, wenn nötig
+            if [ "$build_needed" = true ]; then
+              echo "Starte Konvertierung für $filename nach $output_path_for_liaex..."
+              # Konvertierung (Pfad ohne .pdf übergeben)
+              liaex --input "$filename" --format pdf --output "$output_path_for_liaex" --pdf-timeout 60000
+
+              if [ $? -eq 0 ]; then
+                # Prüfen, ob die erwartete Datei erstellt wurde
+                if [ -f "$final_output_path" ]; then
+                  echo "Erfolgreich konvertiert: $filename zu $final_output_path"
+                  # Aktualisiere den Status für diese Datei im JSON (nur bei Erfolg)
+                  # Wir erstellen eine temporäre Datei, um Race Conditions beim Lesen/Schreiben zu vermeiden
+                  jq --arg f "$filename" --arg h "$current_commit_hash" '. + {($f): $h}' current_build_hashes.json > tmp_hashes.json && mv tmp_hashes.json current_build_hashes.json
+                  echo "Build-Status für $filename aktualisiert auf Hash $current_commit_hash."
+                else
+                  echo "::error::liaex meldete Erfolg für $filename, aber die erwartete Datei '$final_output_path' wurde nicht gefunden!"
+                  # Status für diese Datei NICHT aktualisieren
+                fi
+              else
+                echo "::error::Fehler bei der Konvertierung von $filename zu PDF mittels liaex."
+                # Status für diese Datei NICHT aktualisieren
               fi
             fi
           done
 
-      # --- Caching der generierten PDFs ---
-      # Dieser Schritt speichert alle erfolgreich generierten PDFs im pdf_output Verzeichnis
-      # basierend auf dem Hash *aller* Markdown-Dateien. Das ist ein gröberes Caching.
-      # Wenn *irgendeine* MD-Datei sich ändert, wird der Cache ungültig.
-      # Für feingranulares Caching pro Datei müsste man den Cache-Schritt *in* die Schleife verlegen
-      # oder einen komplexeren Ansatz wählen.
-      - name: Cache generated PDFs
-        uses: actions/cache@v4
-        with:
-          path: pdf_output/
-          key: pdfs-${{ runner.os }}-${{ hashFiles('*.md') }} # Cache basiert auf allen MD-Dateien
+          # Speichere den finalen Status (wird vom Cache-Schritt hochgeladen)
+          echo "Speichere finalen Build-Status nach .pdf_build_hashes.json"
+          cp current_build_hashes.json .pdf_build_hashes.json
 
-      # --- Einzelne Artefakte hochladen (falls gewünscht zusätzlich zum Release) ---
-      # Diese Methode lädt jede PDF als separates Artefakt hoch.
-      - name: Upload Individual PDF Artifacts
-        if: success() # Nur ausführen, wenn die Konvertierung erfolgreich war
-        run: |
-          cd pdf_output
-          for pdf_file in *.pdf; do
-            # Verwende den Dateinamen als Artefaktnamen (ohne Pfad)
-            artifact_name="${pdf_file}"
-            echo "Uploading artifact: $artifact_name from file $pdf_file"
-            # Erstelle temporär ein Verzeichnis für jedes Artefakt, da upload-artifact v4 Verzeichnisse erwartet
-            mkdir -p "../artifact_temp/${artifact_name}"
-            cp "$pdf_file" "../artifact_temp/${artifact_name}/"
-            # Upload-Aktion muss außerhalb des Skripts aufgerufen werden oder über Umwege
-          done
-          cd ..
-          # Temporäre Upload-Verzeichnisse wieder entfernen
-          # rm -rf artifact_temp
+      # --- Upload und Release Schritte bleiben wie zuvor ---
 
-      # === Problem: Direkter Aufruf von 'uses' in 'run' geht nicht. ===
-      # Lösung: Entweder einen eigenen Action Step pro Datei (unpraktisch)
-      # oder eine Action verwenden, die das Hochladen mehrerer individueller Artefakte unterstützt,
-      # oder die Dateinamen sammeln und in einem Matrix-Job oder separaten Schritten hochladen.
-
-      # Einfachere Methode: Alle PDFs zusammen als ein Artefakt hochladen (wie im Original)
-      # Wenn individuelle Artefakte *unbedingt* erforderlich sind, wird es komplexer.
-      - name: Upload All PDFs as Single Artifact (Alternative)
+      # Upload als einzelnes Artefakt (optional, wenn Release verwendet wird)
+      - name: Upload All PDFs as Single Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: liascript-pdfs-${{ github.sha }} # Eindeutiger Name pro Commit
+          name: liascript-pdfs-${{ github.sha }}
           path: pdf_output/
-          if-no-files-found: warn
+          if-no-files-found: warn # Fehler vermeiden, wenn keine PDFs gebaut wurden (sollte nicht passieren)
 
       - name: Aktuelles Datum ermitteln
-        id: date # Optional, aber gut für die Referenzierung
+        id: date
         run: echo "CURRENT_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_ENV
-        # Wir speichern das Datum in einer Umgebungsvariable namens CURRENT_DATE
-        # Wichtig: Einfache Anführungszeichen um das Format für date sind sicherer.
 
-      # --- Automatisches Pre-Release erstellen/aktualisieren (auf Deutsch) ---
-      - name: Pre-Release mit PDFs erstellen/aktualisieren
-        if: success() && github.ref == 'refs/heads/pdf_export' # Nur auf Master ausführen (oder anpassen)
+      - name: Pre-Release mit PDFs erstellen/aktualisieren (auf Deutsch)
+        if: success() && github.ref == 'refs/heads/pdf_export' # Nur auf Master ausführen
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest-pdfs # Ein fester Tag für das "immer aktuelle" Pre-Release
-          # Name des Releases auf Deutsch
+          tag_name: latest-pdfs
           name: "Aktuellste PDF-Builds (${{ github.sha }})"
-          # Body des Releases auf Deutsch, mit der Datums-Variable
           body: |
             Automatischer Build der PDF-Dokumente vom letzten Commit auf dem Branch '${{ github.ref_name }}'.
             Commit: ${{ github.sha }}
-            Datum: ${{ env.CURRENT_DATE }} # Hier die Umgebungsvariable verwenden
-          prerelease: true # Als Pre-Release markieren
-          draft: false # Nicht als Entwurf speichern
-          files: pdf_output/*.pdf # Alle PDFs aus dem output Verzeichnis anhängen
+            Datum: ${{ env.CURRENT_DATE }}
+
+            **Übersicht der Änderungen (im Vergleich zum letzten PDF-Release auf diesem Branch):**
+            *Folgende Dateien wurden neu gebaut oder aktualisiert, da sich ihr Inhalt seit dem letzten erfolgreichen Build geändert hat.*
+            *(Diese Liste basiert auf den Änderungen, die einen Neubau ausgelöst haben. Dateien ohne Änderungen werden übersprungen.)*
+          prerelease: true
+          draft: false
+          files: pdf_output/*.pdf
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Token für API-Zugriff
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

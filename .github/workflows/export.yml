@@ -1,3 +1,7 @@
+# Complete GitHub Actions Workflow File
+# Incorporates per-file commit hash caching, German localization,
+# commit messages, date formatting, corrected PDF naming, and cache debugging.
+
 name: Exporter
 
 on:
@@ -7,66 +11,91 @@ on:
       - pdf_export
   workflow_dispatch:
 
+# Permissions needed for creating/updating releases
 permissions:
-  contents: write # Für Releases
+  contents: write
 
 jobs:
   build_pdfs:
     runs-on: ubuntu-latest
 
     steps:
+      # 1. Checkout code with full history for git log
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Wichtig für git log
+          fetch-depth: 0 # Important for git log
 
+      # 2. Setup Node.js (no npm cache as we don't use package-lock.json)
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          # Kein npm-Cache, da wir keine package-lock.json haben
 
-      # Cache für die generierten PDFs UND die Hash-Statusdatei
-      # Der Key basiert auf dem Branch, damit Caches nicht zwischen Branches geteilt werden.
-      # Restore-keys erlauben das Wiederherstellen eines älteren Caches, falls der exakte Key nicht passt.
+      # 3. Cache generated PDFs and the build status file
+      # Restore based on the branch, save specifically per commit.
       - name: Cache PDF Output und Build Hashes
-        id: pdf-cache
+        id: pdf-cache # ID to reference cache status
         uses: actions/cache@v4
+        # outputs: # Capture cache hit status
+        #   cache-hit: ${{ steps.cache-restore.outputs.cache-hit }} # Corrected reference might depend on exact action implementation - let's try direct output access
         with:
           path: |
             pdf_output/
             .pdf_build_hashes.json
-          key: pdf-builds-${{ runner.os }}-${{ github.ref }}-${{ github.sha }} # Sehr spezifisch, ändert sich bei jedem Commit
+          key: pdf-builds-${{ runner.os }}-${{ github.ref }}-${{ github.sha }} # Specific key for saving
           restore-keys: |
-            pdf-builds-${{ runner.os }}-${{ github.ref }}- # Wichtig: Lädt den letzten Cache für diesen Branch
+            pdf-builds-${{ runner.os }}-${{ github.ref }}- # Key for restoring the latest for the branch
 
+      # 4. DEBUG: Check cache status after attempting restore
+      - name: Debug Cache Status
+        # Run always to see the status, uses the cache step's output ID directly
+        if: always()
+        run: |
+          echo "Cache Hit Status (Output from step 'pdf-cache'): ${{ steps.pdf-cache.outputs.cache-hit }}"
+          echo "Prüfe, ob .pdf_build_hashes.json nach Cache-Restore existiert:"
+          if [ -f ".pdf_build_hashes.json" ]; then
+            echo ".pdf_build_hashes.json wurde aus dem Cache wiederhergestellt."
+            echo "Inhalt:"
+            # Use cat defensively in case the file is empty or invalid
+            cat .pdf_build_hashes.json || echo "(Leere oder fehlerhafte .pdf_build_hashes.json Datei)"
+          else
+            echo ".pdf_build_hashes.json wurde NICHT aus dem Cache wiederhergestellt."
+          fi
+          echo "Aktuelles Verzeichnis enthält:"
+          ls -la
+
+      # 5. Ensure jq is installed (needed for handling the JSON status file)
       - name: Install jq (if needed)
         run: |
           if ! command -v jq &> /dev/null
           then
               echo "jq could not be found, installing..."
+              # Assuming Ubuntu runner
               sudo apt-get update && sudo apt-get install -y jq
           else
               echo "jq is already installed."
           fi
 
+      # 6. Install the global tool LiaScript Exporter
       - name: Install LiaScript Exporter (liaex)
         run: npm install -g @liascript/exporter
 
+      # 7. Create the output directory if it doesn't exist
       - name: Create PDF output directory
-        run: mkdir -p pdf_output # Stellt sicher, dass das Verzeichnis existiert
+        run: mkdir -p pdf_output
 
-      # --- PDF Konvertierung mit per-File Caching basierend auf Commit Hash ---
+      # 8. Main conversion step with per-file caching logic
       - name: Convert Markdown to PDF with Per-File Commit Hash Caching
         id: convert
         run: |
-          # Lade den Build-Status aus der JSON-Datei (falls vorhanden, sonst starte mit leerem Objekt)
-          # Wenn der Cache wiederhergestellt wurde, existiert die Datei eventuell.
+          # Load previous build status from JSON if it exists and is valid
           if [ -f ".pdf_build_hashes.json" ]; then
             echo "Lade vorherigen Build-Status aus .pdf_build_hashes.json"
-            # Stelle sicher, dass die Datei valides JSON enthält, sonst starte leer
             if jq empty .pdf_build_hashes.json > /dev/null 2>&1; then
                cp .pdf_build_hashes.json current_build_hashes.json
+               echo "Vorheriger Status geladen:"
+               cat current_build_hashes.json
             else
                echo "Warnung: .pdf_build_hashes.json ist kein valides JSON. Starte mit leerem Status."
                echo "{}" > current_build_hashes.json
@@ -76,121 +105,131 @@ jobs:
             echo "{}" > current_build_hashes.json
           fi
 
-          # Finde alle Markdown-Dateien im Hauptverzeichnis
+          # Find and process all Markdown files in the root directory
           find . -maxdepth 1 -name "*.md" -print0 | while IFS= read -r -d $'\0' file; do
             filename="${file#./}"
             echo "--- Processing: $filename ---"
 
-            # Aktuellen Commit-Hash und Datum für die Datei ermitteln
+            # Get current commit hash and date for the file
             current_commit_hash=$(git log -1 --pretty="format:%H" -- "$filename")
             commit_date=$(git log -1 --pretty="format:%as" -- "$filename")
-            if [ -z "$commit_date" ]; then # Fallback für Datum
+            if [ -z "$commit_date" ]; then # Fallback for date if no commit found (e.g., new untracked file?)
               commit_date=$(date +%Y-%m-%d)
               echo "Warnung: Konnte keinen Commit für '$filename' finden, verwende aktuelles Datum."
-              # Fallback für Hash (nicht ideal, aber nötig): Nimm den Hash des *Inhalts*
+              # Use content hash as a fallback hash (less ideal for caching logic but better than nothing)
               current_commit_hash=$(git hash-object "$filename")
             fi
 
-            # Zuletzt erfolgreich gebauten Hash aus dem Status lesen
-            # jq -r gibt den rohen String ohne Anführungszeichen zurück, // "" als Fallback
+            # Read the last successfully built hash from our status file
             last_built_hash=$(jq -r --arg f "$filename" '.[$f] // ""' current_build_hashes.json)
             echo "Aktueller Commit-Hash für $filename: $current_commit_hash"
             echo "Zuletzt gebauter Hash für $filename: $last_built_hash"
 
-            # Erwarteten PDF-Dateinamen konstruieren (ohne .pdf für liaex)
+            # Construct expected PDF filename (base for liaex, full name for checks/artifacts)
             base_name="${filename%.md}"
-            safe_base_name=$(echo "$base_name" | sed 's/[^a-zA-Z0-9._-]/_/g')
+            safe_base_name=$(echo "$base_name" | sed 's/[^a-zA-Z0-9._-]/_/g') # Make name filesystem-safe
             pdf_base_for_liaex="${safe_base_name}_${commit_date}"
-            output_path_for_liaex="pdf_output/$pdf_base_for_liaex" # Für liaex --output
+            output_path_for_liaex="pdf_output/$pdf_base_for_liaex" # Path WITHOUT .pdf for liaex
             final_pdf_filename="${pdf_base_for_liaex}.pdf"
-            final_output_path="pdf_output/$final_pdf_filename"     # Erwarteter finaler Pfad
+            final_output_path="pdf_output/$final_pdf_filename"     # Expected final path WITH .pdf
 
-            build_needed=true # Annahme: Build ist nötig
+            build_needed=true # Assume build is needed unless checks pass
 
-            # Prüfen, ob ein Rebuild nötig ist
+            # Check if rebuild is necessary
             if [ "$current_commit_hash" == "$last_built_hash" ]; then
               echo "Commit-Hash für $filename ist unverändert ($current_commit_hash)."
-              # Prüfen, ob die Zieldatei existiert (aus dem Cache wiederhergestellt?)
+              # Additionally check if the target PDF file actually exists (restored from cache?)
               if [ -f "$final_output_path" ]; then
                 echo "PDF '$final_output_path' existiert bereits (vermutlich aus Cache)."
                 echo "--> Überspringe Build für $filename."
                 build_needed=false
               else
                 echo "PDF '$final_output_path' existiert NICHT, obwohl Hash gleich ist. Erzwinge Build."
+                # Keep build_needed=true
               fi
             else
               echo "Commit-Hash für $filename hat sich geändert (alt: '$last_built_hash', neu: '$current_commit_hash'). Build ist nötig."
+              # Keep build_needed=true
             fi
 
-            # Nur bauen, wenn nötig
+            # Perform build only if needed
             if [ "$build_needed" = true ]; then
               echo "Starte Konvertierung für $filename nach $output_path_for_liaex..."
-              # Konvertierung (Pfad ohne .pdf übergeben)
-              liaex --input "$filename" --format pdf --output "$output_path_for_liaex" --pdf-timeout 60000
+              # Conversion command (pass path WITHOUT .pdf)
+              liaex --input "$filename" --format pdf --output "$output_path_for_liaex" --pdf-timeout 60000 # 60 sec timeout
 
               if [ $? -eq 0 ]; then
-                # Prüfen, ob die erwartete Datei erstellt wurde
+                # Verify the expected PDF file was created
                 if [ -f "$final_output_path" ]; then
                   echo "Erfolgreich konvertiert: $filename zu $final_output_path"
-                  # Aktualisiere den Status für diese Datei im JSON (nur bei Erfolg)
-                  # Wir erstellen eine temporäre Datei, um Race Conditions beim Lesen/Schreiben zu vermeiden
+                  # Update the status JSON for this file upon success
+                  # Use temp file to avoid issues during read/write cycle with jq
                   jq --arg f "$filename" --arg h "$current_commit_hash" '. + {($f): $h}' current_build_hashes.json > tmp_hashes.json && mv tmp_hashes.json current_build_hashes.json
                   echo "Build-Status für $filename aktualisiert auf Hash $current_commit_hash."
                 else
-                  echo "::error::liaex meldete Erfolg für $filename, aber die erwartete Datei '$final_output_path' wurde nicht gefunden!"
-                  # Status für diese Datei NICHT aktualisieren
+                  # Liaex reported success, but the expected file is missing!
+                  echo "::error::liaex meldete Erfolg für $filename, aber die erwartete Datei '$final_output_path' wurde nicht gefunden! Überprüfen Sie das liaex-Verhalten bzgl. Dateiendungen."
+                  # Do NOT update build status for this file
                 fi
               else
                 echo "::error::Fehler bei der Konvertierung von $filename zu PDF mittels liaex."
-                # Status für diese Datei NICHT aktualisieren
+                # Do NOT update build status for this file
               fi
-            fi
-          done
+            fi # end if build_needed
+          done # end while loop over files
 
-          # Speichere den finalen Status (wird vom Cache-Schritt hochgeladen)
-          echo "Speichere finalen Build-Status nach .pdf_build_hashes.json"
+          # --- DEBUGGING: Show final status before saving ---
+          echo "--- Finaler Status vor dem Speichern ---"
+          echo "Inhalt von current_build_hashes.json:"
+          cat current_build_hashes.json || echo "(Fehler beim Lesen von current_build_hashes.json)"
+          echo "Kopiere current_build_hashes.json nach .pdf_build_hashes.json..."
+
+          # Save the final accumulated status back to the file the cache step will pick up
           cp current_build_hashes.json .pdf_build_hashes.json
+          if [ $? -eq 0 ]; then
+            echo "Kopieren erfolgreich."
+            echo "Finaler Inhalt von .pdf_build_hashes.json (wird gecached):"
+            cat .pdf_build_hashes.json || echo "(Fehler beim Lesen von .pdf_build_hashes.json nach dem Kopieren)"
+          else
+            echo "::error::Fehler beim Kopieren von current_build_hashes.json nach .pdf_build_hashes.json!"
+          fi
 
-      # --- Upload und Release Schritte bleiben wie zuvor ---
-
-      # Upload als einzelnes Artefakt (optional, wenn Release verwendet wird)
+      # 9. Upload all resulting PDFs as a single artifact (optional if only Release is needed)
       - name: Upload All PDFs as Single Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: liascript-pdfs-${{ github.sha }}
+          name: liascript-pdfs-${{ github.sha }} # Unique name per commit run
           path: pdf_output/
-          if-no-files-found: warn # Fehler vermeiden, wenn keine PDFs gebaut wurden (sollte nicht passieren)
+          if-no-files-found: warn # Don't fail if no PDFs were generated (e.g., error or no MD files)
 
-      # --- Schritt zum Ermitteln des aktuellen Datums und der Uhrzeit (Deutsches Format) ---
+      # 10. Get current date and time in German format
       - name: Aktuelles Datum und Uhrzeit ermitteln (Deutsch)
-        id: datetime # Geänderte ID zur Klarheit
-        run: echo "CURRENT_DATETIME=$(date +'%d.%m.%Y %H:%M:%S Uhr')" >> $GITHUB_ENV
-        # Format: TT.MM.JJJJ HH:MM:SS Uhr (Verwendet die Zeitzone des Runners, oft UTC)
+        id: datetime
+        run: echo "CURRENT_DATETIME=$(date +'%d.%m.%Y %H:%M:%S Uhr')" >> $GITHUB_ENV # TT.MM.JJJJ HH:MM:SS Uhr
 
-      # --- Schritt zum Ermitteln der Commit-Nachricht ---
+      # 11. Get the commit message subject
       - name: Commit-Nachricht ermitteln
         id: commitmessage
         run: echo "COMMIT_MSG=$(git log -1 --pretty='format:%s' ${{ github.sha }})" >> $GITHUB_ENV
-        # Holt die Betreffzeile (%s) des Commits
 
-      # --- Automatisches Pre-Release erstellen/aktualisieren (auf Deutsch) ---
+      # 12. Create or update the pre-release with the generated PDFs
       - name: Pre-Release mit PDFs erstellen/aktualisieren (auf Deutsch)
-        if: success() && github.ref == 'refs/heads/pdf_export' # Nur auf Master ausführen (oder anpassen)
+        # Run only on success and on the target branch(es)
+        if: success() && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/pdf_export')
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest-pdfs # Ein fester Tag für das "immer aktuelle" Pre-Release
-          # Name des Releases auf Deutsch
-          name: "Aktuellste PDF-Builds (${{ github.sha }})"
-          # Body des Releases auf Deutsch, mit deutscher Zeit und Commit-Nachricht
-          body: |
+          tag_name: latest-pdfs # Fixed tag name for the continuously updated release
+          name: "Aktuellste PDF-Builds (${{ github.sha }})" # Release title
+          body: | # Release body (German, with date/time and commit message)
             Automatischer Build der PDF-Dokumente vom letzten Commit auf dem Branch '${{ github.ref_name }}'.
 
             Commit: ${{ github.sha }} (${{ env.COMMIT_MSG }})
             Datum: ${{ env.CURRENT_DATETIME }}
 
             Übersicht der Änderungen:
-          prerelease: true # Als Pre-Release markieren
-          draft: false # Nicht als Entwurf speichern
-          files: pdf_output/*.pdf # Alle PDFs aus dem output Verzeichnis anhängen
+            *(Die angehängten PDFs entsprechen dem oben genannten Commit.)*
+          prerelease: true # Mark as pre-release
+          draft: false    # Make it visible immediately
+          files: pdf_output/*.pdf # Upload all PDFs from the output directory
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Token für API-Zugriff
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Necessary for API access

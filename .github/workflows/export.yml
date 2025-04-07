@@ -161,26 +161,36 @@ jobs:
           path: pdf_output/
           if-no-files-found: warn # Fehler vermeiden, wenn keine PDFs gebaut wurden (sollte nicht passieren)
 
-      - name: Aktuelles Datum ermitteln
-        id: date
-        run: echo "CURRENT_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_ENV
+      # --- Schritt zum Ermitteln des aktuellen Datums und der Uhrzeit (Deutsches Format) ---
+      - name: Aktuelles Datum und Uhrzeit ermitteln (Deutsch)
+        id: datetime # Geänderte ID zur Klarheit
+        run: echo "CURRENT_DATETIME=$(date +'%d.%m.%Y %H:%M:%S Uhr')" >> $GITHUB_ENV
+        # Format: TT.MM.JJJJ HH:MM:SS Uhr (Verwendet die Zeitzone des Runners, oft UTC)
 
+      # --- Schritt zum Ermitteln der Commit-Nachricht ---
+      - name: Commit-Nachricht ermitteln
+        id: commitmessage
+        run: echo "COMMIT_MSG=$(git log -1 --pretty='format:%s' ${{ github.sha }})" >> $GITHUB_ENV
+        # Holt die Betreffzeile (%s) des Commits
+
+      # --- Automatisches Pre-Release erstellen/aktualisieren (auf Deutsch) ---
       - name: Pre-Release mit PDFs erstellen/aktualisieren (auf Deutsch)
-        if: success() && github.ref == 'refs/heads/pdf_export' # Nur auf Master ausführen
+        if: success() && github.ref == 'refs/heads/master' # Nur auf Master ausführen (oder anpassen)
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest-pdfs
+          tag_name: latest-pdfs # Ein fester Tag für das "immer aktuelle" Pre-Release
+          # Name des Releases auf Deutsch
           name: "Aktuellste PDF-Builds (${{ github.sha }})"
+          # Body des Releases auf Deutsch, mit deutscher Zeit und Commit-Nachricht
           body: |
             Automatischer Build der PDF-Dokumente vom letzten Commit auf dem Branch '${{ github.ref_name }}'.
-            Commit: ${{ github.sha }}
-            Datum: ${{ env.CURRENT_DATE }}
 
-            **Übersicht der Änderungen (im Vergleich zum letzten PDF-Release auf diesem Branch):**
-            *Folgende Dateien wurden neu gebaut oder aktualisiert, da sich ihr Inhalt seit dem letzten erfolgreichen Build geändert hat.*
-            *(Diese Liste basiert auf den Änderungen, die einen Neubau ausgelöst haben. Dateien ohne Änderungen werden übersprungen.)*
-          prerelease: true
-          draft: false
-          files: pdf_output/*.pdf
+            Commit: ${{ github.sha }} (${{ env.COMMIT_MSG }})
+            Datum: ${{ env.CURRENT_DATETIME }}
+
+            Übersicht der Änderungen:
+          prerelease: true # Als Pre-Release markieren
+          draft: false # Nicht als Entwurf speichern
+          files: pdf_output/*.pdf # Alle PDFs aus dem output Verzeichnis anhängen
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Token für API-Zugriff

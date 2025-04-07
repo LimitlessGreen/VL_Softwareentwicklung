@@ -175,7 +175,7 @@ jobs:
 
       # --- Automatisches Pre-Release erstellen/aktualisieren (auf Deutsch) ---
       - name: Pre-Release mit PDFs erstellen/aktualisieren (auf Deutsch)
-        if: success() && github.ref == 'refs/heads/master' # Nur auf Master ausführen (oder anpassen)
+        if: success() && github.ref == 'refs/heads/pdf_export' # Nur auf Master ausführen (oder anpassen)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest-pdfs # Ein fester Tag für das "immer aktuelle" Pre-Release

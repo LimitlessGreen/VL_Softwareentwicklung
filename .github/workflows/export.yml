@@ -173,6 +173,30 @@ jobs:
         run: echo "COMMIT_MSG=$(git log -1 --pretty='format:%s' ${{ github.sha }})" >> $GITHUB_ENV
         # Holt die Betreffzeile (%s) des Commits
 
+      - name: Lösche vorhandene Assets im Release
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const releaseTag = 'latest-pdfs'; 
+            // Hole das Release anhand des Tags
+            const { data: release } = await github.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag: releaseTag
+            });
+            // Durchlaufe alle Assets des Releases
+            for (const asset of release.assets) {
+              // Option: Je nach Namenskonvention filtern – hier z.B. alle PDFs
+              if (asset.name.endsWith('.pdf')) {
+                await github.rest.repos.deleteReleaseAsset({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  asset_id: asset.id
+                });
+                console.log(`Gelöscht: ${asset.name}`);
+              }
+            }
+
       # --- Automatisches Pre-Release erstellen/aktualisieren (auf Deutsch) ---
       - name: Pre-Release mit PDFs erstellen/aktualisieren (auf Deutsch)
         if: success() && github.ref == 'refs/heads/pdf_export' # Nur auf Master ausführen (oder anpassen)

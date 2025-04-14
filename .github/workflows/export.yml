@@ -36,7 +36,7 @@ jobs:
           path: |
             pdf_output/
             .pdf_build_hashes.json
-          key: pdf-builds-${{ runner.os }}-${{ github.ref }}-${{ github.sha }} # Sehr spezifisch, ändert sich bei jedem Commit
+          key: pdf-builds-${{ runner.os }}-${{ github.ref }}
           restore-keys: |
             pdf-builds-${{ runner.os }}-${{ github.ref }}- # Wichtig: Lädt den letzten Cache für diesen Branch
 

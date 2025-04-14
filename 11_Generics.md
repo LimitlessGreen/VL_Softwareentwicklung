@@ -5,7 +5,7 @@ email:    sebastian.zug@informatik.tu-freiberg.de
 version:  1.0.5
 language: de
 narrator: Deutsch Female
-comment:  Generische Typen und Methoden, Constrains und Vererbung bei generischen Typen
+comment:  Generische Typen und Methoden, Constraints und Vererbung bei generischen Typen
 tags:      
 logo:     
 

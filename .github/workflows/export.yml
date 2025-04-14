@@ -177,16 +177,16 @@ jobs:
         uses: actions/github-script@v6
         with:
           script: |
-            const releaseTag = 'latest-pdfs'; 
-            // Hole das Release anhand des Tags
-            const { data: release } = await github.repos.getReleaseByTag({
+            const releaseTag = 'latest-pdfs';
+            // Hole das Release anhand des Tags über den REST-Client
+            const { data: release } = await github.rest.repos.getReleaseByTag({
               owner: context.repo.owner,
               repo: context.repo.repo,
               tag: releaseTag
             });
             // Durchlaufe alle Assets des Releases
             for (const asset of release.assets) {
-              // Option: Je nach Namenskonvention filtern – hier z.B. alle PDFs
+              // Filtere beispielsweise alle PDF-Dateien heraus
               if (asset.name.endsWith('.pdf')) {
                 await github.rest.repos.deleteReleaseAsset({
                   owner: context.repo.owner,
